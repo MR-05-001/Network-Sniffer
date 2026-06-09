@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (if you ever add one)
+venv/
+env/
+.env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Output data from the sniffer
+*.pcap
+*.csv
