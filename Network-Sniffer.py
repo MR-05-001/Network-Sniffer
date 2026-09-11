@@ -8,7 +8,6 @@ import datetime
 import time
 import os
 import sys
-import csv
 import queue
 import json
 import urllib.request
@@ -17,7 +16,9 @@ from typing import Dict, Any, Optional, List, Tuple
 
 # ─── Platform & Constants ────────────────────────────────────────────────────
 
+IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform.startswith("darwin")
 
 # Well-known protocols and ports
 PROTO_MAP = {1: "ICMP", 6: "TCP", 17: "UDP", 58: "IPv6-ICMP"}
@@ -39,9 +40,9 @@ WELL_KNOWN_PORTS = {
 
 class PacketInfo:
     __slots__ = [
-        'id', 'ts', 'time_str', 'length', 'link_layer', 'network_layer', 
-        'transport_layer', 'proto_name', 'src_mac', 'dst_mac', 
-        'src_ip', 'dst_ip', 'sport', 'dport', 'flags', 'ttl', 
+        'id', 'ts', 'time_str', 'length', 'link_layer', 'network_layer',
+        'transport_layer', 'proto_name', 'src_mac', 'dst_mac',
+        'src_ip', 'dst_ip', 'sport', 'dport', 'flags', 'ttl',
         'info', 'raw_data', 'app_layer', 'flow_key', 'is_ipv6'
     ]
     def __init__(self):
@@ -52,6 +53,8 @@ class PacketInfo:
         self.network_layer = {}
         self.transport_layer = {}
         self.is_ipv6 = False
+        self.src_ip = ""
+        self.dst_ip = ""
 
 # ─── Shared Thread-Safe State ────────────────────────────────────────────────
 
@@ -64,13 +67,14 @@ class SnifferState:
         self.alerts = deque(maxlen=1000)
         self.stats = {'TCP': 0, 'UDP': 0, 'ICMP': 0, 'Total': 0, 'Bytes': 0}
         self.syn_tracker = defaultdict(list)
-        
+
         self.dns_cache = {}
         self.dns_queue = queue.Queue()
         self.geoip_cache = {}
         self.geoip_queue = queue.Queue()
-        
+
     def resolve_ip(self, ip: str) -> str:
+        if not ip: return ""
         if ip in self.dns_cache:
             return self.dns_cache[ip]
         self.dns_queue.put(ip)
@@ -78,6 +82,7 @@ class SnifferState:
         return ip
 
     def resolve_geoip(self, ip: str) -> str:
+        if not ip: return "Unknown"
         if ip in ("127.0.0.1", "0.0.0.0") or ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
             return "Local"
         if ip in self.geoip_cache:
@@ -121,17 +126,17 @@ threading.Thread(target=geoip_worker, daemon=True).start()
 
 class PacketParser:
     @staticmethod
-    def parse(raw_data: bytes, ts: float, os_is_windows: bool) -> Optional[PacketInfo]:
+    def parse(raw_data: bytes, ts: float, os_is_linux: bool) -> Optional[PacketInfo]:
         pkt = PacketInfo()
         pkt.ts = ts
         pkt.time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
         pkt.length = len(raw_data)
         pkt.raw_data = raw_data
-        
+
         offset = 0
-        
-        # 1. Link Layer (Ethernet) - Linux AF_PACKET includes this, Windows IP_HDRINCL does not
-        if not os_is_windows:
+
+        # 1. Link Layer (Ethernet) - Linux AF_PACKET includes this, Windows/macOS IP_HDRINCL does not
+        if os_is_linux:
             if len(raw_data) < 14: return None
             eth_header = struct.unpack("!6s6sH", raw_data[:14])
             pkt.dst_mac = PacketParser._mac_format(eth_header[0])
@@ -139,6 +144,7 @@ class PacketParser:
             eth_type = eth_header[2]
             pkt.link_layer = {"Dst MAC": pkt.dst_mac, "Src MAC": pkt.src_mac, "Type": hex(eth_type)}
             offset = 14
+            
             if eth_type == 0x8100: # VLAN
                 offset += 4
             elif eth_type == 0x0806: # ARP
@@ -159,13 +165,13 @@ class PacketParser:
         # 2. Network Layer
         if len(raw_data) <= offset: return None
         version = raw_data[offset] >> 4
-        
+
         if version == 4:
             if len(raw_data) < offset + 20: return None
             iph = struct.unpack("!BBHHHBBH4s4s", raw_data[offset:offset+20])
             ihl = (iph[0] & 0xF) * 4
-            pkt.ttl = iph[6]
-            proto_id = iph[7]
+            pkt.ttl = iph[5]
+            proto_id = iph[6]
             pkt.src_ip = socket.inet_ntoa(iph[8])
             pkt.dst_ip = socket.inet_ntoa(iph[9])
             pkt.network_layer = {
@@ -187,7 +193,7 @@ class PacketParser:
             }
             offset += 40
         else:
-            return None # Not IP
+            return None # Not IP or unexpected structure
 
         pkt.proto_name = PROTO_MAP.get(proto_id, f"#{proto_id}")
 
@@ -209,7 +215,7 @@ class PacketParser:
             pkt.info = f"{pkt.sport} > {pkt.dport} [{','.join(pkt.flags)}] Seq={tcph[2]} Win={tcph[6]}"
             app_data = payload[hl:]
             PacketParser._inspect_app_layer(pkt, app_data, 6)
-            
+
         elif proto_id == 17: # UDP
             if len(payload) < 8: return pkt
             udph = struct.unpack("!HHHH", payload[:8])
@@ -221,7 +227,7 @@ class PacketParser:
             pkt.info = f"{pkt.sport} > {pkt.dport} Len={udph[2]}"
             app_data = payload[8:]
             PacketParser._inspect_app_layer(pkt, app_data, 17)
-            
+
         elif proto_id in (1, 58): # ICMP / ICMPv6
             if len(payload) < 4: return pkt
             icmph = struct.unpack("!BBH", payload[:4])
@@ -237,7 +243,7 @@ class PacketParser:
         if hasattr(pkt, 'sport'):
             ep1, ep2 = f"{pkt.src_ip}:{pkt.sport}", f"{pkt.dst_ip}:{pkt.dport}"
             pkt.flow_key = (min(ep1, ep2), max(ep1, ep2), pkt.proto_name)
-        else:
+        elif pkt.src_ip and pkt.dst_ip:
             pkt.flow_key = (min(pkt.src_ip, pkt.dst_ip), max(pkt.src_ip, pkt.dst_ip), pkt.proto_name)
 
         return pkt
@@ -250,7 +256,7 @@ class PacketParser:
     def _inspect_app_layer(pkt: PacketInfo, data: bytes, proto_id: int):
         if not data: return
         sport, dport = pkt.sport, pkt.dport
-        
+
         # HTTP
         if sport == 80 or dport == 80:
             idx = data.find(b'\r\n')
@@ -259,20 +265,20 @@ class PacketParser:
                 if any(line.startswith(m) for m in ("GET ", "POST ", "HTTP/")):
                     pkt.app_layer["HTTP"] = line
                     pkt.info = line
-                    
+
         # TLS (SNI Detection)
         elif sport == 443 or dport == 443:
             if len(data) > 5 and data[0] == 0x16 and data[1] == 0x03:
                 pkt.app_layer["TLS"] = "TLS Handshake"
                 pkt.info = "TLS Client/Server Hello"
-                
+
         # DNS
         elif (sport == 53 or dport == 53) and proto_id == 17:
             if len(data) >= 12:
                 tx_id, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
                 is_resp = (flags & 0x8000) != 0
                 pkt.app_layer["DNS"] = f"TX: 0x{tx_id:04x}, Queries: {qd}, Answers: {an}"
-                
+
                 try:
                     idx = 12
                     qname = []
@@ -287,7 +293,7 @@ class PacketParser:
                         pkt.app_layer["DNS Query"] = domain
                 except:
                     pkt.info = f"DNS {'Response' if is_resp else 'Query'} 0x{tx_id:04x}"
-                
+
         # Cleartext credentials check (FTP/Telnet)
         if sport in (21, 23) or dport in (21, 23):
             text = data.decode('utf-8', errors='ignore').strip()
@@ -346,6 +352,8 @@ class FilterEngine:
 class FlowTracker:
     @staticmethod
     def update(pkt: PacketInfo):
+        if not hasattr(pkt, 'flow_key'): return
+        
         fk = pkt.flow_key
         with STATE.lock:
             if fk not in STATE.flows:
@@ -357,15 +365,17 @@ class FlowTracker:
             f['last_ts'] = pkt.ts
             f['pkts'] += 1
             f['bytes'] += pkt.length
-            
+
             if pkt.proto_name == "TCP" and "FIN" in pkt.flags:
                 f['state'] = 'CLOSED'
 
             # Update endpoints
-            STATE.endpoints[pkt.src_ip]['tx_pkts'] += 1
-            STATE.endpoints[pkt.src_ip]['tx_bytes'] += pkt.length
-            STATE.endpoints[pkt.dst_ip]['rx_pkts'] += 1
-            STATE.endpoints[pkt.dst_ip]['rx_bytes'] += pkt.length
+            if pkt.src_ip:
+                STATE.endpoints[pkt.src_ip]['tx_pkts'] += 1
+                STATE.endpoints[pkt.src_ip]['tx_bytes'] += pkt.length
+            if pkt.dst_ip:
+                STATE.endpoints[pkt.dst_ip]['rx_pkts'] += 1
+                STATE.endpoints[pkt.dst_ip]['rx_bytes'] += pkt.length
 
 class SecurityAnalyzer:
     @staticmethod
@@ -373,7 +383,7 @@ class SecurityAnalyzer:
         # Cleartext Alert
         if "Cleartext" in pkt.app_layer:
             SecurityAnalyzer._alert("HIGH", "Cleartext Credentials", f"{pkt.src_ip} sent unencrypted credentials.", pkt)
-        
+
         # SYN Scan / Flood heuristic
         if pkt.proto_name == "TCP" and pkt.flags == ["SYN"]:
             with STATE.lock:
@@ -410,24 +420,47 @@ class CaptureEngine:
 
     def stop(self):
         self.running = False
+        # Let the capture loop notice `self.running is False` and return.
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
         if self.sock:
             if IS_WINDOWS:
-                try: self.sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
-                except: pass
-            self.sock.close()
+                try:
+                    self.sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                except OSError:
+                    pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
 
     def _capture_loop(self):
         try:
-            if IS_WINDOWS:
+            # On Windows and macOS, we use AF_INET. On Linux, we use AF_PACKET.
+            if IS_WINDOWS or IS_MAC:
+                # Require admin/root privileges
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
-                self.sock.bind((self.interface, 0))
+                
+                # Bind to the specific interface if provided, otherwise let OS decide
+                if self.interface != "ALL":
+                    self.sock.bind((self.interface, 0))
+                else:
+                    # Windows typically needs an explicit IP to bind for SIO_RCVALL
+                    host_ip = socket.gethostbyname(socket.gethostname())
+                    self.sock.bind((host_ip, 0))
+
                 self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                self.sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+                
+                if IS_WINDOWS:
+                    self.sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
             else:
+                # Linux AF_PACKET captures Ethernet frames
                 self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
                 if self.interface != "ALL":
                     self.sock.bind((self.interface, 0))
-            
+
             self.sock.settimeout(1.0)
             while self.running:
                 try:
@@ -435,8 +468,13 @@ class CaptureEngine:
                     self.process_queue.put((raw, time.time()))
                 except socket.timeout:
                     continue
+                except OSError:
+                    # Socket was closed/invalidated
+                    break
+        except PermissionError as e:
+            if self.running: self.process_queue.put(e)
         except OSError as e:
-            self.process_queue.put(e)
+            if self.running: self.process_queue.put(e)
 
 class ProcessWorker(threading.Thread):
     def __init__(self, in_queue: queue.Queue, ui_queue: queue.Queue):
@@ -448,27 +486,31 @@ class ProcessWorker(threading.Thread):
     def run(self):
         pkt_id = 0
         while self.running:
-            item = self.in_queue.get()
+            try:
+                item = self.in_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
             if isinstance(item, Exception):
                 self.ui_queue.put(item)
                 continue
-                
+
             raw, ts = item
-            pkt = PacketParser.parse(raw, ts, IS_WINDOWS)
+            pkt = PacketParser.parse(raw, ts, IS_LINUX)
             if not pkt: continue
-            
+
             pkt_id += 1
             pkt.id = pkt_id
-            
+
             with STATE.lock:
                 STATE.packet_store.append(pkt)
                 STATE.stats['Total'] += 1
                 STATE.stats['Bytes'] += pkt.length
                 STATE.stats[pkt.proto_name] = STATE.stats.get(pkt.proto_name, 0) + 1
-            
+
             FlowTracker.update(pkt)
             SecurityAnalyzer.inspect(pkt)
-            
+
             # Prevent UI Queue from blowing up memory if UI is slow
             if self.ui_queue.qsize() < 2000:
                 self.ui_queue.put(pkt)
@@ -492,10 +534,10 @@ class NetworkAnalyzerApp(ctk.CTk):
         self.title("Network Protocol Analyzer")
         self.geometry("1400x900")
         self.minsize(1200, 700)
-        
+
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
-        
+
         self.C_BG = "#0d1117"
         self.C_CARD = "#161b22"
         self.C_HOVER = "#21262d"
@@ -524,7 +566,7 @@ class NetworkAnalyzerApp(ctk.CTk):
     def _init_styles(self):
         self.FONT_MONO = ("Consolas", 11) if IS_WINDOWS else ("Monospace", 11)
         self.FONT_SANS = ("Segoe UI", 11) if IS_WINDOWS else ("Sans", 11)
-        
+
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Treeview", background="#1f1f1f", foreground="#dce4ee", fieldbackground="#1f1f1f", rowheight=28, borderwidth=0, font=self.FONT_MONO)
@@ -534,9 +576,14 @@ class NetworkAnalyzerApp(ctk.CTk):
         style.configure("Vertical.TScrollbar", background="#1f1f1f", troughcolor="#121212", arrowcolor="#dce4ee", borderwidth=0)
 
     def _get_interfaces(self) -> List[str]:
-        if IS_WINDOWS:
-            addrs = socket.getaddrinfo(socket.gethostname(), None)
-            return list(set([a[4][0] for a in addrs if a[0] == socket.AF_INET]))
+        if IS_WINDOWS or IS_MAC:
+            try:
+                addrs = socket.getaddrinfo(socket.gethostname(), None)
+                ifaces = list(set([a[4][0] for a in addrs if a[0] == socket.AF_INET]))
+                # If we couldn't resolve, try 127.0.0.1
+                return ifaces if ifaces else ["127.0.0.1"]
+            except OSError:
+                return ["127.0.0.1"]
         else:
             try: return ["ALL"] + os.listdir('/sys/class/net/')
             except: return ["ALL"]
@@ -560,23 +607,23 @@ class NetworkAnalyzerApp(ctk.CTk):
         ctk.CTkButton(ctrl, text="📂 Load PCAP", command=self.load_pcap, width=120).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="💾 Export PCAP", command=self.export_pcap, width=120).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="🗑 Clear", command=self.clear_data, fg_color="#4b5563", hover_color="#374151", width=100).pack(side="right", padx=4)
-        
+
         self.btn_stop = ctk.CTkButton(ctrl, text="⏹ Stop", command=self.stop_capture, fg_color="#dc2626", hover_color="#b91c1c", width=100)
         self.btn_stop.pack(side="right", padx=4)
         self.btn_stop.configure(state="disabled")
-        
+
         self.btn_start = ctk.CTkButton(ctrl, text="⏵ Start", command=self.start_capture, fg_color="#10b981", hover_color="#059669", width=100)
         self.btn_start.pack(side="right", padx=4)
 
         # ── Filter Bar ──
         filter_bar = ctk.CTkFrame(self)
         filter_bar.pack(fill="x", padx=20, pady=(0, 10))
-        
+
         ctk.CTkLabel(filter_bar, text="Filter (Metadata):").pack(side="left", padx=(10,8), pady=8)
         self.filter_entry = ctk.CTkEntry(filter_bar, width=300, placeholder_text="e.g., port == 443", font=ctk.CTkFont(family="Consolas", size=13))
         self.filter_entry.pack(side="left", padx=4)
         self.filter_entry.bind("<Return>", lambda e: self.apply_filter())
-        
+
         ctk.CTkLabel(filter_bar, text="Search Payload:").pack(side="left", padx=(20,8))
         self.search_entry = ctk.CTkEntry(filter_bar, width=200, font=ctk.CTkFont(family="Consolas", size=13))
         self.search_entry.pack(side="left", padx=4)
@@ -623,18 +670,14 @@ class NetworkAnalyzerApp(ctk.CTk):
         self.tree = ttk.Treeview(paned, columns=cols, show="headings", selectmode="browse")
         widths = [60, 100, 70, 140, 60, 140, 60, 60, 350]
         for col, w in zip(cols, widths):
-            self.tree.heading(col, text=col)
+            self.tree.heading(col, text=col, anchor="w")
             self.tree.column(col, width=w, minwidth=50, anchor="w")
-            
-        self.tree.tag_configure("TCP", foreground="#60a5fa")
-        self.tree.tag_configure("UDP", foreground="#c084fc")
-        self.tree.tag_configure("ICMP", foreground="#fcd34d")
-        
+
         vsb = ttk.Scrollbar(self.tree, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_packet_select)
-        
+
         self.tree.tag_configure("TCP", foreground="#60a5fa", background="#2b2b2b")
         self.tree.tag_configure("UDP", foreground="#c084fc", background="#2b2b2b")
         self.tree.tag_configure("ICMP", foreground="#fcd34d", background="#2b2b2b")
@@ -655,7 +698,7 @@ class NetworkAnalyzerApp(ctk.CTk):
         # Details Paned
         det_paned = tk.PanedWindow(paned, orient="horizontal", bg="#2b2b2b", sashrelief="flat", sashwidth=6)
         paned.add(det_paned, minsize=200)
-        
+
         # Hierarchical Details
         self.det_tree = ttk.Treeview(det_paned, show="tree", selectmode="none")
         det_vsb = ttk.Scrollbar(self.det_tree, orient="vertical", command=self.det_tree.yview)
@@ -670,8 +713,8 @@ class NetworkAnalyzerApp(ctk.CTk):
     def _build_conv_tab(self, parent):
         cols = ("Address A", "Address B", "Protocol", "Packets", "Bytes", "State")
         self.conv_tree = ttk.Treeview(parent, columns=cols, show="headings")
-        for col in cols: 
-            self.conv_tree.heading(col, text=col)
+        for col in cols:
+            self.conv_tree.heading(col, text=col, anchor="w")
             self.conv_tree.column(col, width=150, anchor="w")
         self.conv_tree.pack(fill="both", expand=True, pady=10)
 
@@ -679,17 +722,17 @@ class NetworkAnalyzerApp(ctk.CTk):
         cols = ("IP Address", "Hostname", "Location", "Tx Packets", "Rx Packets", "Tx Bytes", "Rx Bytes")
         self.ep_tree = ttk.Treeview(parent, columns=cols, show="headings")
         for col in cols:
-            self.ep_tree.heading(col, text=col)
+            self.ep_tree.heading(col, text=col, anchor="w")
             self.ep_tree.column(col, width=120, anchor="w")
         self.ep_tree.pack(fill="both", expand=True, pady=10)
 
     def _build_sec_tab(self, parent):
         cols = ("Time", "Severity", "Source", "Message")
         self.sec_tree = ttk.Treeview(parent, columns=cols, show="headings")
-        self.sec_tree.heading("Time", text="Time"); self.sec_tree.column("Time", width=120)
-        self.sec_tree.heading("Severity", text="Severity"); self.sec_tree.column("Severity", width=100)
-        self.sec_tree.heading("Source", text="Source"); self.sec_tree.column("Source", width=150)
-        self.sec_tree.heading("Message", text="Message"); self.sec_tree.column("Message", width=600)
+        self.sec_tree.heading("Time", text="Time", anchor="w"); self.sec_tree.column("Time", width=120, anchor="w")
+        self.sec_tree.heading("Severity", text="Severity", anchor="w"); self.sec_tree.column("Severity", width=100, anchor="w")
+        self.sec_tree.heading("Source", text="Source", anchor="w"); self.sec_tree.column("Source", width=150, anchor="w")
+        self.sec_tree.heading("Message", text="Message", anchor="w"); self.sec_tree.column("Message", width=600, anchor="w")
         self.sec_tree.tag_configure("HIGH", foreground=self.C_DANGER)
         self.sec_tree.tag_configure("MEDIUM", foreground="#f59e0b")
         self.sec_tree.pack(fill="both", expand=True, pady=10)
@@ -704,22 +747,22 @@ class NetworkAnalyzerApp(ctk.CTk):
         w = self.graph_canvas.winfo_width()
         h = self.graph_canvas.winfo_height()
         if w < 50 or h < 50: return
-        
+
         history = list(self.traffic_history)
         if not history: return
-        
+
         max_val = max(history) if max(history) > 0 else 1000
-        
+
         for i in range(5):
             y = h - (h * (i / 4.0))
             if i > 0: self.graph_canvas.create_line(0, y, w, y, fill=self.C_HOVER, dash=(4, 4))
             self.graph_canvas.create_text(5, y-10, text=f"{max_val * (i/4.0) / 1024:.1f} KB/s", fill=self.C_MUTED, anchor="w", font=self.FONT_SANS)
-            
+
         pts = []
         step_x = w / 60.0
         for i, val in enumerate(history):
             pts.extend([i * step_x, h - (val / max_val * h)])
-            
+
         if len(pts) >= 4:
             self.graph_canvas.create_line(*pts, fill=self.C_PRIMARY, width=2, smooth=True)
 
@@ -733,68 +776,75 @@ class NetworkAnalyzerApp(ctk.CTk):
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
         if w < 100 or h < 100: return
-        
+
         # Pie Chart Data
         stats = {k: v for k, v in STATE.stats.items() if k not in ("Total", "Bytes")}
         total_p = sum(stats.values())
         if total_p == 0:
             c.create_text(w/2, h/2, text="No Data Available Yet", fill="#dce4ee", font=self.FONT_SANS)
             return
-            
+
         # Draw Pie Chart
         colors = ["#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#ef4444", "#14b8a6"]
         start = 0
-        cx, cy, r = w*0.25, h*0.5, min(w, h)*0.35
+        
+        # Adjust layout parameters to prevent text overlap
+        cx, cy = w * 0.25, h * 0.5
+        r = min(w * 0.15, h * 0.35) 
+        
         c.create_text(cx, cy - r - 20, text="Protocol Distribution", fill="#dce4ee", font=("Segoe UI", 14, "bold"))
         for i, (k, v) in enumerate(stats.items()):
             if v == 0: continue
             extent = (v / total_p) * 360
             color = colors[i % len(colors)]
             c.create_arc(cx-r, cy-r, cx+r, cy+r, start=start, extent=extent, fill=color, outline="#1f1f1f")
-            
+
             # Legend
             ly = cy - r + (i * 25) + 20
             c.create_rectangle(cx+r+30, ly-5, cx+r+45, ly+10, fill=color, outline=color)
             c.create_text(cx+r+55, ly+2, text=f"{k}: {v} ({v/total_p*100:.1f}%)", fill="#dce4ee", anchor="w", font=self.FONT_SANS)
             start += extent
-            
+
         # Top Talkers Bar Chart
-        c.create_text(w*0.75, h*0.1, text="Top Talkers (Bytes)", fill="#dce4ee", font=("Segoe UI", 14, "bold"))
+        bar_x = w * 0.70  # Shifted further right to avoid overlaps
+        bar_w = w * 0.20  
+        
+        c.create_text(bar_x + (bar_w/2), h*0.1, text="Top Talkers (Bytes)", fill="#dce4ee", font=("Segoe UI", 14, "bold"))
         top_eps = sorted(STATE.endpoints.items(), key=lambda x: x[1]['tx_bytes'] + x[1]['rx_bytes'], reverse=True)[:5]
         if not top_eps: return
-        
+
         max_b = (top_eps[0][1]['tx_bytes'] + top_eps[0][1]['rx_bytes']) or 1
-        bar_w = w * 0.25
-        bar_x = w * 0.6
         bar_y_start = h * 0.2
-        
+
         for i, (ip, ed) in enumerate(top_eps):
             val = ed['tx_bytes'] + ed['rx_bytes']
             bw = (val / max_b) * bar_w
             by = bar_y_start + (i * 55)
             c.create_rectangle(bar_x, by, bar_x + bw, by + 25, fill="#3b82f6", outline="")
-            c.create_text(bar_x - 10, by + 12, text=f"{ip} ({STATE.resolve_geoip(ip).split(',')[0]})", fill="#dce4ee", anchor="e", font=self.FONT_SANS)
+            
+            ip_label = f"{ip} ({STATE.resolve_geoip(ip).split(',')[0]})"
+            c.create_text(bar_x - 10, by + 12, text=ip_label, fill="#dce4ee", anchor="e", font=self.FONT_SANS)
             c.create_text(bar_x + bw + 10, by + 12, text=f"{val/1024:.1f} KB", fill="#dce4ee", anchor="w", font=self.FONT_SANS)
 
     # ── Actions ──
-    
+
     def apply_filter(self):
         self.filter_str = self.filter_entry.get().strip()
         search_term = self.search_entry.get().strip().lower()
         if self.filter_str.startswith("e.g.,"): self.filter_str = ""
         self.tree.delete(*self.tree.get_children())
         self.tree_iids.clear()
-        
+
         # Re-evaluate history
         with STATE.lock:
             pkts = list(STATE.packet_store)
-            
+
         for pkt in pkts:
             match_meta = FilterEngine.evaluate(pkt, self.filter_str)
             match_search = True
             if search_term:
                 match_search = (pkt.raw_data and search_term.encode() in pkt.raw_data.lower()) or (search_term in str(pkt.info).lower())
-            
+
             if match_meta and match_search:
                 self._insert_to_tree(pkt)
 
@@ -812,7 +862,7 @@ class NetworkAnalyzerApp(ctk.CTk):
         self.status_lbl.configure(text="● Capturing...", text_color=self.C_GREEN)
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        
+
         self.capture_engine = CaptureEngine(iface, self.process_queue)
         self.process_worker = ProcessWorker(self.process_queue, self.ui_queue)
         self.capture_engine.start()
@@ -856,7 +906,7 @@ class NetworkAnalyzerApp(ctk.CTk):
                     msg = "Permission Denied: Run as Root/Administrator." if isinstance(pkt, PermissionError) else str(pkt)
                     messagebox.showerror("Capture Error", msg)
                     break
-                    
+
                 match_meta = not self.filter_str or FilterEngine.evaluate(pkt, self.filter_str)
                 search_term = self.search_entry.get().strip().lower()
                 match_search = True
@@ -870,7 +920,7 @@ class NetworkAnalyzerApp(ctk.CTk):
 
         if last_item and self.auto_scroll_var.get() and not self.tree.selection():
             self.tree.see(last_item)
-            
+
         self.after(50, self._poll_ui_queue)
 
     def _insert_to_tree(self, pkt):
@@ -878,21 +928,21 @@ class NetworkAnalyzerApp(ctk.CTk):
         dst_res = STATE.resolve_ip(pkt.dst_ip)
         src_disp = src_res if src_res != pkt.src_ip else pkt.src_ip
         dst_disp = dst_res if dst_res != pkt.dst_ip else pkt.dst_ip
-        
+
         row = (
-            pkt.id, pkt.time_str, pkt.proto_name, 
-            src_disp, getattr(pkt, 'sport', ''), 
-            dst_disp, getattr(pkt, 'dport', ''), 
+            pkt.id, pkt.time_str, pkt.proto_name,
+            src_disp, getattr(pkt, 'sport', ''),
+            dst_disp, getattr(pkt, 'dport', ''),
             pkt.length, pkt.info
         )
         tag = pkt.proto_name if pkt.proto_name in ("TCP", "UDP", "ICMP", "ARP", "DNS") else ""
         if "HTTP" in pkt.app_layer: tag = "HTTP"
         if "TLS" in pkt.app_layer: tag = "TLS"
         if "Cleartext" in pkt.app_layer: tag = "ALERT"
-        
+
         iid = self.tree.insert("", "end", iid=str(pkt.id), values=row, tags=(tag,))
         self.tree_iids.append(iid)
-        
+
         # Enforce UI bound
         if len(self.tree_iids) > 2000:
             old_iid = self.tree_iids.popleft()
@@ -906,28 +956,28 @@ class NetworkAnalyzerApp(ctk.CTk):
             t, tcp, udp, b = STATE.stats['Total'], STATE.stats.get('TCP',0), STATE.stats.get('UDP',0), STATE.stats['Bytes']
             mb = b / (1024*1024)
             self.stat_lbl.configure(text=f"Total: {t} | TCP: {tcp} | UDP: {udp} | Data: {mb:.2f} MB")
-            
+
             # Notebook updates based on visible tab to save CPU
             curr_tab = self.notebook.get()
-            
+
             if curr_tab == "Conversations": # Conversations
                 self.conv_tree.delete(*self.conv_tree.get_children())
                 for fk, fd in sorted(STATE.flows.items(), key=lambda x: x[1]['bytes'], reverse=True)[:50]:
                     self.conv_tree.insert("", "end", values=(fk[0], fk[1], fk[2], fd['pkts'], fd['bytes'], fd.get('state', '')))
-            
+
             elif curr_tab == "Endpoints": # Endpoints
                 self.ep_tree.delete(*self.ep_tree.get_children())
                 for ip, ed in sorted(STATE.endpoints.items(), key=lambda x: x[1]['tx_bytes'] + x[1]['rx_bytes'], reverse=True)[:50]:
                     self.ep_tree.insert("", "end", values=(ip, STATE.resolve_ip(ip), STATE.resolve_geoip(ip), ed['tx_pkts'], ed['rx_pkts'], ed['tx_bytes'], ed['rx_bytes']))
-            
+
             elif curr_tab == "Security Alerts": # Security
                 self.sec_tree.delete(*self.sec_tree.get_children())
                 for a in reversed(STATE.alerts):
                     self.sec_tree.insert("", "end", values=(a['time'], a['severity'], a['src'], a['msg']), tags=(a['severity'],))
-            
+
             elif curr_tab == "Dashboard":
                 self._draw_dashboard()
-                    
+
             # Record bandwidth for graph
             current_bytes = STATE.stats['Bytes']
             bps = current_bytes - self.last_total_bytes
@@ -935,49 +985,53 @@ class NetworkAnalyzerApp(ctk.CTk):
             self.last_total_bytes = current_bytes
             if curr_tab == "Traffic Graph":
                 self._draw_graph()
-                
+
         self.after(1000, self._update_dashboard_loop)
 
     def _on_packet_select(self, event):
         sel = self.tree.selection()
         if not sel: return
         pkt_id = int(sel[0])
-        
+
         with STATE.lock:
             pkt = next((p for p in reversed(STATE.packet_store) if p.id == pkt_id), None)
-            
+
         if not pkt: return
-        
+
         self.det_tree.delete(*self.det_tree.get_children())
-        
+
         # Frame
         f_id = self.det_tree.insert("", "end", text=f"Frame (Length: {pkt.length} bytes)")
         self.det_tree.insert(f_id, "end", text=f"Arrival Time: {pkt.time_str}")
-        
+
         # Link Layer
         if pkt.link_layer:
             l_id = self.det_tree.insert("", "end", text="Ethernet II")
             for k, v in pkt.link_layer.items():
                 self.det_tree.insert(l_id, "end", text=f"{k}: {v}")
-                
+
         # Network Layer
         if pkt.network_layer:
-            n_id = self.det_tree.insert("", "end", text=f"IPv{pkt.network_layer['Version']}")
+            if 'Version' in pkt.network_layer:
+                n_label = f"IPv{pkt.network_layer['Version']}"
+            else:
+                n_label = pkt.proto_name or "Network Layer"
+            n_id = self.det_tree.insert("", "end", text=n_label)
             for k, v in pkt.network_layer.items():
                 self.det_tree.insert(n_id, "end", text=f"{k}: {v}")
-                
+
         # Transport Layer
         if pkt.transport_layer:
             t_id = self.det_tree.insert("", "end", text=pkt.proto_name)
             for k, v in pkt.transport_layer.items():
                 self.det_tree.insert(t_id, "end", text=f"{k}: {v}")
-                
+
         # App Layer
         if pkt.app_layer:
             a_id = self.det_tree.insert("", "end", text="Application Data")
             for k, v in pkt.app_layer.items():
                 self.det_tree.insert(a_id, "end", text=f"{k}: {v}")
-                
+
         # Hex
         self._set_text(self.hex_text, hexdump(pkt.raw_data))
 
@@ -994,22 +1048,22 @@ class NetworkAnalyzerApp(ctk.CTk):
         with STATE.lock:
             target_pkt = next((p for p in STATE.packet_store if p.id == pkt_id), None)
         if not target_pkt or target_pkt.proto_name != "TCP": return messagebox.showinfo("Info", "Select a TCP packet to follow.")
-        
+
         fk = target_pkt.flow_key
         stream_data = []
         with STATE.lock:
             for p in STATE.packet_store:
                 if getattr(p, 'flow_key', None) == fk and p.proto_name == "TCP" and p.raw_data:
-                    # Very rough payload extraction based on header sizes
-                    hl = (p.network_layer.get("Header Length", 20)) + (p.transport_layer.get("Seq", 0)*0 + 20) # Approx TCP len
                     if not p.is_ipv6:
-                        app_data = p.raw_data[(14 if not IS_WINDOWS else 0) + p.network_layer.get("Header Length", 20) + 20:]
+                        # Approximate payload offset: link header (if present) + IP header + 20-byte TCP header.
+                        # This assumes no TCP options; streams using options may show a few extra bytes.
+                        app_data = p.raw_data[(14 if IS_LINUX else 0) + p.network_layer.get("Header Length", 20) + 20:]
                         if app_data:
                             direction = "CLIENT" if p.src_ip == target_pkt.src_ip else "SERVER"
                             stream_data.append(f"--- {direction} ---\n{app_data.decode('utf-8', errors='replace')}")
 
         if not stream_data: return messagebox.showinfo("Info", "No payload data found for this stream.")
-        
+
         top = ctk.CTkToplevel(self)
         top.title(f"TCP Stream: {fk[0]} <-> {fk[1]}")
         top.geometry("800x600")
@@ -1021,11 +1075,11 @@ class NetworkAnalyzerApp(ctk.CTk):
     def export_pcap(self):
         with STATE.lock: pkts = list(STATE.packet_store)
         if not pkts: return messagebox.showinfo("Export", "No packets to export.")
-        
+
         path = filedialog.asksaveasfilename(defaultextension=".pcap", filetypes=[("PCAP","*.pcap")])
         if not path: return
-        
-        link_type = 101 if IS_WINDOWS else 1 
+
+        link_type = 1 if IS_LINUX else 101
         try:
             with open(path, "wb") as f:
                 f.write(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, link_type))
@@ -1042,15 +1096,15 @@ class NetworkAnalyzerApp(ctk.CTk):
         if self.is_capturing:
             messagebox.showinfo("Info", "Stop the live capture first.")
             return
-            
+
         path = filedialog.askopenfilename(filetypes=[("PCAP", "*.pcap")])
         if not path: return
         self.clear_data()
-        
+
         self.status_lbl.configure(text=f"● Loaded Offline PCAP: {os.path.basename(path)}", text_color=self.C_PRIMARY)
         self.process_worker = ProcessWorker(self.process_queue, self.ui_queue)
         self.process_worker.start()
-        
+
         threading.Thread(target=self._load_pcap_worker, args=(path,), daemon=True).start()
 
     def _load_pcap_worker(self, path):
@@ -1063,13 +1117,13 @@ class NetworkAnalyzerApp(ctk.CTk):
                 if magic == 0xd4c3b2a1:
                     magic, vmaj, vmin, tz, sf, snaplen, network = struct.unpack(">IHHIIII", global_hdr)
                     is_le = False
-                
+
                 # Check link type to handle ethernet offset
                 link_type = network
-                is_win_fake = IS_WINDOWS
-                if link_type == 1: is_win_fake = False # Ethernet
-                elif link_type == 101: is_win_fake = True # Raw IP
-                
+                is_linux_format = IS_LINUX
+                if link_type == 1: is_linux_format = True # Ethernet
+                elif link_type == 101: is_linux_format = False # Raw IP
+
                 while True:
                     hdr = f.read(16)
                     if len(hdr) < 16: break
@@ -1077,13 +1131,12 @@ class NetworkAnalyzerApp(ctk.CTk):
                     raw_data = f.read(incl_len)
                     if not raw_data: break
                     ts = sec + usec / 1000000.0
-                    
+
                     # Trick the parser if we are on windows loading linux pcap or vice versa
-                    pkt = PacketParser.parse(raw_data, ts, is_win_fake)
+                    pkt = PacketParser.parse(raw_data, ts, is_linux_format)
                     if pkt:
-                        # Process logic manually to avoid breaking things, or just use queue
                         self.process_queue.put((raw_data, ts))
-                        
+
                     time.sleep(0.001) # Small delay to not overwhelm UI
         except Exception as e:
             print(f"Error loading PCAP: {e}")
